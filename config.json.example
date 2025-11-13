@@ -1,0 +1,26 @@
+{
+    "api_key": "YOUR_BINANCE_API_KEY_HERE",
+    "api_secret": "YOUR_BINANCE_API_SECRET_HERE",
+    "testnet": true,
+    "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
+    "timeframe": "1m",
+    "bollinger_bands": {
+        "period": 20,
+        "std_dev": 2
+    },
+    "trade_params": {
+        "quantity_percentage": 0.1,
+        "take_profit_percentage": 0.5,
+        "stop_loss_percentage": 0.3,
+        "max_open_positions": 3
+    },
+    "risk_management": {
+        "max_position_size_usd": 100,
+        "min_spread_percentage": 0.05
+    },
+    "execution": {
+        "websocket_enabled": true,
+        "order_retry_attempts": 3,
+        "latency_optimization": true
+    }
+}

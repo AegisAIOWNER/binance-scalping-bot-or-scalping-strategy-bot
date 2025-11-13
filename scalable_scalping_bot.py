@@ -20,7 +20,7 @@ import numpy as np
 from binance.client import Client
 from binance.enums import *
 from binance.exceptions import BinanceAPIException
-from binance.websocket import BinanceSocketManager
+from binance import ThreadedWebsocketManager
 import asyncio
 
 # Configure logging
@@ -68,7 +68,7 @@ class ScalpingBot:
         """Initialize the scalping bot with configuration"""
         self.config = self._load_config(config_file)
         self.client = self._init_client()
-        self.bsm = None
+        self.twm = None
         
         # Data storage for each symbol
         self.price_data: Dict[str, List[float]] = defaultdict(list)
@@ -407,23 +407,23 @@ class ScalpingBot:
             return
         
         logger.info("Starting WebSocket connections...")
-        self.bsm = BinanceSocketManager(self.client)
+        self.twm = ThreadedWebsocketManager(
+            api_key=self.config['api_key'],
+            api_secret=self.config['api_secret'],
+            testnet=self.config.get('testnet', False)
+        )
+        self.twm.start()
         
         # Start kline streams for all symbols
-        streams = []
         for symbol in self.config['symbols']:
-            stream = self.bsm.kline_socket(
+            self.twm.start_kline_socket(
+                callback=self.on_kline_message,
                 symbol=symbol.lower(),
-                interval=self.config['timeframe'],
-                callback=self.on_kline_message
+                interval=self.config['timeframe']
             )
-            streams.append(stream)
+            logger.info(f"Started WebSocket stream for {symbol}")
         
-        # Start all streams
-        for stream in streams:
-            stream.start()
-        
-        logger.info(f"WebSocket streams started for {len(streams)} symbols")
+        logger.info(f"WebSocket streams started for {len(self.config['symbols'])} symbols")
     
     def fetch_historical_data(self, symbol: str, limit: int = None):
         """Fetch historical kline data to initialize price history"""
@@ -504,8 +504,8 @@ class ScalpingBot:
                     time.sleep(1)
             except KeyboardInterrupt:
                 logger.info("Stopping bot...")
-                if self.bsm:
-                    self.bsm.close()
+                if self.twm:
+                    self.twm.stop()
         else:
             self.run_polling_mode()
         

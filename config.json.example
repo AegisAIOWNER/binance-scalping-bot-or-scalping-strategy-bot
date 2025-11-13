@@ -1,6 +1,6 @@
 {
-    "api_key": "YOUR_BINANCE_API_KEY",
-    "api_secret": "YOUR_BINANCE_API_SECRET",
+    "api_key": "YOUR_BINANCE_API_KEY_HERE",
+    "api_secret": "YOUR_BINANCE_API_SECRET_HERE",
     "testnet": true,
     "symbols": ["BTCUSDT", "ETHUSDT", "BNBUSDT"],
     "timeframe": "1m",

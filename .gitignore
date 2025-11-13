@@ -41,6 +41,7 @@ Thumbs.db
 
 # Config with sensitive data
 config.json.local
+config.json
 
 # Temp files
 *.tmp

@@ -8,6 +8,12 @@
         "period": 20,
         "std_dev": 2
     },
+    "rsi": {
+        "enabled": true,
+        "period": 14,
+        "oversold_threshold": 30,
+        "overbought_threshold": 70
+    },
     "trade_params": {
         "quantity_percentage": 0.1,
         "take_profit_percentage": 0.5,
@@ -15,12 +21,24 @@
         "max_open_positions": 3
     },
     "risk_management": {
+        "position_size_type": "percentage",
+        "risk_percentage_per_trade": 1.0,
         "max_position_size_usd": 100,
         "min_spread_percentage": 0.05
+    },
+    "pair_selection": {
+        "dynamic_enabled": false,
+        "quote_asset": "USDT",
+        "min_volume_usd": 10000000,
+        "min_volatility_percent": 1.0,
+        "max_pairs": 10
     },
     "execution": {
         "websocket_enabled": true,
         "order_retry_attempts": 3,
         "latency_optimization": true
+    },
+    "backtest": {
+        "initial_balance": 10000
     }
 }

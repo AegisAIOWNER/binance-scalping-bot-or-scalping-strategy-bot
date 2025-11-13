@@ -61,6 +61,43 @@ class BollingerBands:
         return upper_band, sma, lower_band
 
 
+class RSI:
+    """Calculate Relative Strength Index (RSI) indicator"""
+    
+    def __init__(self, period: int = 14):
+        self.period = period
+    
+    def calculate(self, prices: List[float]) -> Optional[float]:
+        """
+        Calculate RSI
+        
+        Args:
+            prices: List of closing prices
+            
+        Returns:
+            RSI value (0-100) or None if insufficient data
+        """
+        if len(prices) < self.period + 1:
+            return None
+        
+        prices_array = np.array(prices[-(self.period + 1):])
+        deltas = np.diff(prices_array)
+        
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        
+        avg_gain = np.mean(gains)
+        avg_loss = np.mean(losses)
+        
+        if avg_loss == 0:
+            return 100.0
+        
+        rs = avg_gain / avg_loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+
+
 class ScalpingBot:
     """Advanced Scalping Bot for Binance"""
     
@@ -72,6 +109,7 @@ class ScalpingBot:
         
         # Data storage for each symbol
         self.price_data: Dict[str, List[float]] = defaultdict(list)
+        self.volume_data: Dict[str, List[float]] = defaultdict(list)
         self.current_positions: Dict[str, dict] = {}
         self.lock = threading.Lock()
         
@@ -82,9 +120,21 @@ class ScalpingBot:
             std_dev=bb_config['std_dev']
         )
         
+        # RSI calculator
+        rsi_config = self.config.get('rsi', {'period': 14, 'enabled': True})
+        self.rsi_enabled = rsi_config.get('enabled', True)
+        self.rsi_calculator = RSI(period=rsi_config.get('period', 14))
+        self.rsi_oversold = rsi_config.get('oversold_threshold', 30)
+        self.rsi_overbought = rsi_config.get('overbought_threshold', 70)
+        
         # Execution optimization
         self.websocket_enabled = self.config['execution']['websocket_enabled']
         self.order_retry_attempts = self.config['execution']['order_retry_attempts']
+        
+        # Account balance cache
+        self.account_balance_cache = {}
+        self.balance_cache_time = 0
+        self.balance_cache_ttl = 30  # Cache for 30 seconds
         
         logger.info("Scalping bot initialized successfully")
     
@@ -141,22 +191,133 @@ class ScalpingBot:
             logger.error(f"Error getting spread for {symbol}: {e}")
             return None, None, None
     
-    def update_price_data(self, symbol: str, price: float):
+    def get_account_balance(self, quote_asset: str = 'USDT') -> Optional[float]:
+        """
+        Get account balance for a specific asset with caching
+        
+        Args:
+            quote_asset: Asset to check balance for (default: USDT)
+            
+        Returns:
+            Available balance or None if error
+        """
+        current_time = time.time()
+        
+        # Use cache if recent
+        if current_time - self.balance_cache_time < self.balance_cache_ttl:
+            if quote_asset in self.account_balance_cache:
+                return self.account_balance_cache[quote_asset]
+        
+        try:
+            account_info = self.client.get_account()
+            for balance in account_info['balances']:
+                if balance['asset'] == quote_asset:
+                    free_balance = float(balance['free'])
+                    # Update cache
+                    self.account_balance_cache[quote_asset] = free_balance
+                    self.balance_cache_time = current_time
+                    return free_balance
+            return 0.0
+        except BinanceAPIException as e:
+            logger.error(f"Error getting account balance: {e}")
+            return None
+    
+    def get_symbol_volume_volatility(self, symbol: str) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Get 24h volume and price volatility for a symbol
+        
+        Returns:
+            Tuple of (24h_volume_usd, price_change_percent)
+        """
+        try:
+            ticker = self.client.get_ticker(symbol=symbol)
+            volume = float(ticker['quoteVolume'])  # 24h volume in quote asset (usually USDT)
+            price_change_pct = float(ticker['priceChangePercent'])
+            return volume, abs(price_change_pct)
+        except BinanceAPIException as e:
+            logger.error(f"Error getting volume/volatility for {symbol}: {e}")
+            return None, None
+    
+    def select_dynamic_pairs(self) -> List[str]:
+        """
+        Dynamically select trading pairs based on volume and volatility
+        
+        Returns:
+            List of selected trading pairs
+        """
+        pair_selection = self.config.get('pair_selection', {})
+        
+        if not pair_selection.get('dynamic_enabled', False):
+            # Return static list from config
+            return self.config.get('symbols', [])
+        
+        try:
+            quote_asset = pair_selection.get('quote_asset', 'USDT')
+            min_volume = pair_selection.get('min_volume_usd', 10000000)  # $10M default
+            min_volatility = pair_selection.get('min_volatility_percent', 1.0)  # 1% default
+            max_pairs = pair_selection.get('max_pairs', 10)
+            
+            # Get all tickers
+            tickers = self.client.get_ticker()
+            
+            # Filter pairs
+            candidates = []
+            for ticker in tickers:
+                symbol = ticker['symbol']
+                
+                # Only consider pairs with the specified quote asset
+                if not symbol.endswith(quote_asset):
+                    continue
+                
+                # Skip stable coins and leverage tokens
+                base_asset = symbol.replace(quote_asset, '')
+                skip_assets = ['USDC', 'BUSD', 'TUSD', 'PAX', 'UP', 'DOWN', 'BULL', 'BEAR']
+                if any(skip in base_asset for skip in skip_assets):
+                    continue
+                
+                volume = float(ticker['quoteVolume'])
+                price_change = abs(float(ticker['priceChangePercent']))
+                
+                # Apply filters
+                if volume >= min_volume and price_change >= min_volatility:
+                    candidates.append({
+                        'symbol': symbol,
+                        'volume': volume,
+                        'volatility': price_change,
+                        'score': volume * price_change  # Simple scoring
+                    })
+            
+            # Sort by score and take top pairs
+            candidates.sort(key=lambda x: x['score'], reverse=True)
+            selected_pairs = [c['symbol'] for c in candidates[:max_pairs]]
+            
+            logger.info(f"Selected {len(selected_pairs)} dynamic pairs: {selected_pairs}")
+            return selected_pairs
+            
+        except BinanceAPIException as e:
+            logger.error(f"Error selecting dynamic pairs: {e}")
+            # Fallback to static list
+            return self.config.get('symbols', [])
+    
+    def update_price_data(self, symbol: str, price: float, volume: float = 0):
         """Update price data for a symbol (thread-safe)"""
         with self.lock:
             self.price_data[symbol].append(price)
+            self.volume_data[symbol].append(volume)
             # Keep only recent data to optimize memory
-            max_history = self.config['bollinger_bands']['period'] * 2
+            max_history = max(self.config['bollinger_bands']['period'], 
+                            self.config.get('rsi', {}).get('period', 14)) * 2
             if len(self.price_data[symbol]) > max_history:
                 self.price_data[symbol] = self.price_data[symbol][-max_history:]
+                self.volume_data[symbol] = self.volume_data[symbol][-max_history:]
     
     def analyze_signal(self, symbol: str) -> Optional[str]:
         """
-        Analyze Bollinger Bands for trading signals
+        Analyze Bollinger Bands and RSI for trading signals
         
         Returns:
-            'BUY' if price touches/crosses lower band (oversold)
-            'SELL' if price touches/crosses upper band (overbought)
+            'BUY' if price touches/crosses lower band (oversold) and RSI confirms
+            'SELL' if price touches/crosses upper band (overbought) and RSI confirms
             None if no signal
         """
         with self.lock:
@@ -172,21 +333,77 @@ class ScalpingBot:
         
         current_price = prices[-1]
         
+        # Calculate RSI if enabled
+        rsi_value = None
+        if self.rsi_enabled:
+            rsi_value = self.rsi_calculator.calculate(prices)
+        
         # Buy signal: price at or below lower band (oversold)
         if current_price <= lower * 1.001:  # Small tolerance
-            logger.info(f"{symbol} BUY signal: Price {current_price:.8f} <= Lower BB {lower:.8f}")
+            # If RSI enabled, confirm with RSI
+            if self.rsi_enabled and rsi_value is not None:
+                if rsi_value > self.rsi_oversold:
+                    # RSI not oversold, skip signal
+                    return None
+                logger.info(f"{symbol} BUY signal: Price {current_price:.8f} <= Lower BB {lower:.8f}, RSI {rsi_value:.2f}")
+            else:
+                logger.info(f"{symbol} BUY signal: Price {current_price:.8f} <= Lower BB {lower:.8f}")
             return 'BUY'
         
         # Sell signal: price at or above upper band (overbought)
         elif current_price >= upper * 0.999:  # Small tolerance
-            logger.info(f"{symbol} SELL signal: Price {current_price:.8f} >= Upper BB {upper:.8f}")
+            # If RSI enabled, confirm with RSI
+            if self.rsi_enabled and rsi_value is not None:
+                if rsi_value < self.rsi_overbought:
+                    # RSI not overbought, skip signal
+                    return None
+                logger.info(f"{symbol} SELL signal: Price {current_price:.8f} >= Upper BB {upper:.8f}, RSI {rsi_value:.2f}")
+            else:
+                logger.info(f"{symbol} SELL signal: Price {current_price:.8f} >= Upper BB {upper:.8f}")
             return 'SELL'
         
         return None
     
-    def calculate_position_size(self, symbol: str, price: float) -> float:
-        """Calculate position size based on risk management parameters"""
-        max_position_usd = self.config['risk_management']['max_position_size_usd']
+    def calculate_position_size(self, symbol: str, price: float) -> Optional[float]:
+        """
+        Calculate position size based on account balance and risk percentage
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            price: Current price
+            
+        Returns:
+            Position size in base asset quantity, or None if insufficient funds
+        """
+        # Extract quote asset from symbol (usually USDT)
+        quote_asset = 'USDT'  # Default
+        if symbol.endswith('USDT'):
+            quote_asset = 'USDT'
+        elif symbol.endswith('BUSD'):
+            quote_asset = 'BUSD'
+        elif symbol.endswith('BTC'):
+            quote_asset = 'BTC'
+        
+        # Get account balance
+        balance = self.get_account_balance(quote_asset)
+        if balance is None or balance == 0:
+            logger.warning(f"Insufficient {quote_asset} balance")
+            return None
+        
+        # Calculate position size
+        risk_config = self.config['risk_management']
+        
+        # Use percentage-based sizing if enabled
+        if risk_config.get('position_size_type', 'fixed') == 'percentage':
+            risk_percentage = risk_config.get('risk_percentage_per_trade', 1.0)
+            max_position_usd = balance * (risk_percentage / 100)
+        else:
+            # Use fixed USD amount (legacy)
+            max_position_usd = risk_config.get('max_position_size_usd', 100)
+        
+        # Ensure we don't exceed available balance
+        max_position_usd = min(max_position_usd, balance * 0.95)  # Leave 5% buffer
+        
         quantity = max_position_usd / price
         
         # Get symbol info for precision
@@ -204,8 +421,16 @@ class ScalpingBot:
                 # Round down to step size
                 precision = len(str(step_size).rstrip('0').split('.')[-1])
                 quantity = max(min_qty, round(quantity - (quantity % step_size), precision))
+                
+                # Final check: ensure we have enough balance
+                required_balance = quantity * price
+                if required_balance > balance:
+                    logger.warning(f"Insufficient balance for {symbol}. Required: {required_balance:.2f}, Available: {balance:.2f}")
+                    return None
+                    
         except Exception as e:
             logger.error(f"Error calculating position size for {symbol}: {e}")
+            return None
         
         return quantity
     
@@ -282,7 +507,7 @@ class ScalpingBot:
         return None
     
     def execute_trade(self, symbol: str, signal: str):
-        """Execute a trade based on the signal"""
+        """Execute a trade based on the signal with balance and safety checks"""
         # Check if we've reached max open positions
         if len(self.current_positions) >= self.config['trade_params']['max_open_positions']:
             logger.warning(f"Max open positions reached. Skipping trade for {symbol}")
@@ -306,8 +531,11 @@ class ScalpingBot:
         if current_price is None:
             return
         
-        # Calculate position size
+        # Calculate position size (includes balance check)
         quantity = self.calculate_position_size(symbol, current_price)
+        if quantity is None:
+            logger.warning(f"Cannot calculate position size for {symbol} - insufficient balance or error")
+            return
         
         try:
             # Place market order to enter position
@@ -512,14 +740,223 @@ class ScalpingBot:
         logger.info("Bot stopped")
 
 
+class BacktestSimulator:
+    """Backtesting simulator for the scalping strategy"""
+    
+    def __init__(self, config_file: str = 'config.json'):
+        """Initialize backtesting simulator"""
+        self.config = self._load_config(config_file)
+        self.client = self._init_client()
+        
+        # Indicators
+        bb_config = self.config['bollinger_bands']
+        self.bb_calculator = BollingerBands(
+            period=bb_config['period'],
+            std_dev=bb_config['std_dev']
+        )
+        
+        rsi_config = self.config.get('rsi', {'period': 14, 'enabled': True})
+        self.rsi_enabled = rsi_config.get('enabled', True)
+        self.rsi_calculator = RSI(period=rsi_config.get('period', 14))
+        self.rsi_oversold = rsi_config.get('oversold_threshold', 30)
+        self.rsi_overbought = rsi_config.get('overbought_threshold', 70)
+        
+        # Results tracking
+        self.trades = []
+        self.balance = self.config.get('backtest', {}).get('initial_balance', 10000)
+        self.initial_balance = self.balance
+        
+    def _load_config(self, config_file: str) -> dict:
+        """Load configuration from JSON file"""
+        with open(config_file, 'r') as f:
+            return json.load(f)
+    
+    def _init_client(self) -> Client:
+        """Initialize Binance client"""
+        api_key = self.config['api_key']
+        api_secret = self.config['api_secret']
+        return Client(api_key, api_secret, testnet=self.config.get('testnet', False))
+    
+    def run_backtest(self, symbol: str, days: int = 7):
+        """
+        Run backtest on historical data
+        
+        Args:
+            symbol: Trading pair to backtest
+            days: Number of days of historical data to use
+        """
+        logger.info(f"Starting backtest for {symbol} over {days} days")
+        logger.info(f"Initial balance: ${self.initial_balance:.2f}")
+        
+        # Fetch historical data
+        interval = self.config['timeframe']
+        limit = days * 24 * 60  # Assuming 1m intervals
+        if interval == '5m':
+            limit = days * 24 * 12
+        elif interval == '15m':
+            limit = days * 24 * 4
+        elif interval == '1h':
+            limit = days * 24
+        
+        limit = min(limit, 1000)  # API limit
+        
+        try:
+            klines = self.client.get_klines(
+                symbol=symbol,
+                interval=interval,
+                limit=limit
+            )
+        except BinanceAPIException as e:
+            logger.error(f"Error fetching historical data: {e}")
+            return
+        
+        # Process klines
+        price_history = []
+        position = None
+        
+        for i, kline in enumerate(klines):
+            close_price = float(kline[4])
+            price_history.append(close_price)
+            
+            # Need enough data for indicators
+            if len(price_history) < max(self.config['bollinger_bands']['period'], 
+                                       self.config.get('rsi', {}).get('period', 14)) + 1:
+                continue
+            
+            # Calculate indicators
+            upper, middle, lower = self.bb_calculator.calculate(price_history)
+            rsi_value = self.rsi_calculator.calculate(price_history) if self.rsi_enabled else None
+            
+            if upper is None:
+                continue
+            
+            # Check for entry signals if no position
+            if position is None:
+                # Buy signal
+                if close_price <= lower * 1.001:
+                    if not self.rsi_enabled or (rsi_value and rsi_value <= self.rsi_oversold):
+                        # Calculate position size
+                        risk_pct = self.config['risk_management'].get('risk_percentage_per_trade', 1.0)
+                        position_size_usd = self.balance * (risk_pct / 100)
+                        quantity = position_size_usd / close_price
+                        
+                        position = {
+                            'type': 'BUY',
+                            'entry_price': close_price,
+                            'quantity': quantity,
+                            'entry_index': i
+                        }
+                        logger.info(f"[Backtest] BUY at {close_price:.8f}, RSI: {rsi_value:.2f if rsi_value else 'N/A'}")
+                
+                # Sell signal
+                elif close_price >= upper * 0.999:
+                    if not self.rsi_enabled or (rsi_value and rsi_value >= self.rsi_overbought):
+                        # For short positions (not implemented in simple backtest)
+                        pass
+            
+            # Check for exit if we have a position
+            elif position:
+                entry_price = position['entry_price']
+                quantity = position['quantity']
+                
+                # Calculate profit/loss targets
+                tp_pct = self.config['trade_params']['take_profit_percentage']
+                sl_pct = self.config['trade_params']['stop_loss_percentage']
+                
+                take_profit_price = entry_price * (1 + tp_pct / 100)
+                stop_loss_price = entry_price * (1 - sl_pct / 100)
+                
+                # Check if TP or SL hit
+                if close_price >= take_profit_price:
+                    # Take profit
+                    pnl = quantity * (close_price - entry_price)
+                    self.balance += pnl
+                    
+                    self.trades.append({
+                        'entry_price': entry_price,
+                        'exit_price': close_price,
+                        'pnl': pnl,
+                        'pnl_pct': ((close_price - entry_price) / entry_price) * 100,
+                        'type': 'TP',
+                        'duration': i - position['entry_index']
+                    })
+                    
+                    logger.info(f"[Backtest] TP at {close_price:.8f}, PnL: ${pnl:.2f} ({self.trades[-1]['pnl_pct']:.2f}%)")
+                    position = None
+                    
+                elif close_price <= stop_loss_price:
+                    # Stop loss
+                    pnl = quantity * (close_price - entry_price)
+                    self.balance += pnl
+                    
+                    self.trades.append({
+                        'entry_price': entry_price,
+                        'exit_price': close_price,
+                        'pnl': pnl,
+                        'pnl_pct': ((close_price - entry_price) / entry_price) * 100,
+                        'type': 'SL',
+                        'duration': i - position['entry_index']
+                    })
+                    
+                    logger.info(f"[Backtest] SL at {close_price:.8f}, PnL: ${pnl:.2f} ({self.trades[-1]['pnl_pct']:.2f}%)")
+                    position = None
+        
+        # Print results
+        self.print_results()
+    
+    def print_results(self):
+        """Print backtest results"""
+        logger.info("=" * 60)
+        logger.info("BACKTEST RESULTS")
+        logger.info("=" * 60)
+        logger.info(f"Initial Balance: ${self.initial_balance:.2f}")
+        logger.info(f"Final Balance: ${self.balance:.2f}")
+        logger.info(f"Total PnL: ${self.balance - self.initial_balance:.2f} ({((self.balance - self.initial_balance) / self.initial_balance * 100):.2f}%)")
+        logger.info(f"Total Trades: {len(self.trades)}")
+        
+        if self.trades:
+            winning_trades = [t for t in self.trades if t['pnl'] > 0]
+            losing_trades = [t for t in self.trades if t['pnl'] <= 0]
+            
+            logger.info(f"Winning Trades: {len(winning_trades)} ({len(winning_trades)/len(self.trades)*100:.1f}%)")
+            logger.info(f"Losing Trades: {len(losing_trades)} ({len(losing_trades)/len(self.trades)*100:.1f}%)")
+            
+            if winning_trades:
+                avg_win = np.mean([t['pnl'] for t in winning_trades])
+                logger.info(f"Average Win: ${avg_win:.2f}")
+            
+            if losing_trades:
+                avg_loss = np.mean([t['pnl'] for t in losing_trades])
+                logger.info(f"Average Loss: ${avg_loss:.2f}")
+            
+            avg_duration = np.mean([t['duration'] for t in self.trades])
+            logger.info(f"Average Trade Duration: {avg_duration:.1f} candles")
+        
+        logger.info("=" * 60)
+
+
 def main():
     """Main function"""
-    try:
-        bot = ScalpingBot('config.json')
-        bot.run()
-    except Exception as e:
-        logger.error(f"Fatal error: {e}", exc_info=True)
-        return 1
+    import sys
+    
+    # Check if running in backtest mode
+    if len(sys.argv) > 1 and sys.argv[1] == '--backtest':
+        try:
+            symbol = sys.argv[2] if len(sys.argv) > 2 else 'BTCUSDT'
+            days = int(sys.argv[3]) if len(sys.argv) > 3 else 7
+            
+            simulator = BacktestSimulator('config.json')
+            simulator.run_backtest(symbol, days)
+        except Exception as e:
+            logger.error(f"Backtest error: {e}", exc_info=True)
+            return 1
+    else:
+        try:
+            bot = ScalpingBot('config.json')
+            bot.run()
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            return 1
     
     return 0
 

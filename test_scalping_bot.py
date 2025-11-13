@@ -9,7 +9,7 @@ import os
 import tempfile
 from unittest.mock import Mock, patch, MagicMock
 import numpy as np
-from scalable_scalping_bot import BollingerBands, ScalpingBot
+from scalable_scalping_bot import BollingerBands, RSI, ScalpingBot, BacktestSimulator
 
 
 class TestBollingerBands(unittest.TestCase):
@@ -290,7 +290,162 @@ class TestScalpingBotDataManagement(unittest.TestCase):
             bot.update_price_data('BTCUSDT', 100.0 + i)
         
         # Should keep only max_history items
-        self.assertEqual(len(bot.price_data['BTCUSDT']), max_history)
+        # Note: max_history is now based on max of BB and RSI periods
+        expected_max = max(bot.config['bollinger_bands']['period'], 
+                          bot.config.get('rsi', {}).get('period', 14)) * 2
+        self.assertEqual(len(bot.price_data['BTCUSDT']), expected_max)
+
+
+class TestRSI(unittest.TestCase):
+    """Test cases for RSI calculation"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.rsi = RSI(period=14)
+    
+    def test_insufficient_data(self):
+        """Test RSI with insufficient data"""
+        prices = [100.0] * 10
+        rsi_value = self.rsi.calculate(prices)
+        self.assertIsNone(rsi_value)
+    
+    def test_rising_prices(self):
+        """Test RSI with rising prices (should be high)"""
+        prices = list(range(100, 130))  # Consistently rising
+        rsi_value = self.rsi.calculate(prices)
+        self.assertIsNotNone(rsi_value)
+        self.assertGreater(rsi_value, 50)  # Should be above 50
+    
+    def test_falling_prices(self):
+        """Test RSI with falling prices (should be low)"""
+        prices = list(range(130, 100, -1))  # Consistently falling
+        rsi_value = self.rsi.calculate(prices)
+        self.assertIsNotNone(rsi_value)
+        self.assertLess(rsi_value, 50)  # Should be below 50
+    
+    def test_rsi_range(self):
+        """Test that RSI is always between 0 and 100"""
+        # Create volatile price data
+        prices = [100 + np.sin(i/5) * 10 for i in range(30)]
+        rsi_value = self.rsi.calculate(prices)
+        self.assertIsNotNone(rsi_value)
+        self.assertGreaterEqual(rsi_value, 0)
+        self.assertLessEqual(rsi_value, 100)
+
+
+class TestEnhancedFeatures(unittest.TestCase):
+    """Test cases for enhanced features"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.config_data = {
+            "api_key": "test_key",
+            "api_secret": "test_secret",
+            "testnet": True,
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1m",
+            "bollinger_bands": {
+                "period": 20,
+                "std_dev": 2
+            },
+            "rsi": {
+                "enabled": True,
+                "period": 14,
+                "oversold_threshold": 30,
+                "overbought_threshold": 70
+            },
+            "trade_params": {
+                "quantity_percentage": 0.1,
+                "take_profit_percentage": 0.5,
+                "stop_loss_percentage": 0.3,
+                "max_open_positions": 3
+            },
+            "risk_management": {
+                "position_size_type": "percentage",
+                "risk_percentage_per_trade": 1.0,
+                "max_position_size_usd": 100,
+                "min_spread_percentage": 0.05
+            },
+            "pair_selection": {
+                "dynamic_enabled": False,
+                "quote_asset": "USDT",
+                "min_volume_usd": 10000000,
+                "min_volatility_percent": 1.0,
+                "max_pairs": 10
+            },
+            "execution": {
+                "websocket_enabled": False,
+                "order_retry_attempts": 3,
+                "latency_optimization": True
+            }
+        }
+        
+        self.temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(self.config_data, self.temp_file)
+        self.temp_file.close()
+    
+    def tearDown(self):
+        """Clean up"""
+        if os.path.exists(self.temp_file.name):
+            os.unlink(self.temp_file.name)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_rsi_initialization(self, mock_client):
+        """Test RSI calculator initialization"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        self.assertTrue(bot.rsi_enabled)
+        self.assertEqual(bot.rsi_calculator.period, 14)
+        self.assertEqual(bot.rsi_oversold, 30)
+        self.assertEqual(bot.rsi_overbought, 70)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_account_balance_cache(self, mock_client):
+        """Test account balance caching"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock the client response
+        mock_client.return_value.get_account.return_value = {
+            'balances': [
+                {'asset': 'USDT', 'free': '1000.0', 'locked': '0.0'}
+            ]
+        }
+        
+        # First call should hit API
+        balance1 = bot.get_account_balance('USDT')
+        self.assertEqual(balance1, 1000.0)
+        
+        # Second call should use cache
+        balance2 = bot.get_account_balance('USDT')
+        self.assertEqual(balance2, 1000.0)
+        self.assertEqual(balance1, balance2)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_position_sizing_percentage(self, mock_client):
+        """Test percentage-based position sizing"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock balance
+        mock_client.return_value.get_account.return_value = {
+            'balances': [
+                {'asset': 'USDT', 'free': '10000.0', 'locked': '0.0'}
+            ]
+        }
+        
+        # Mock symbol info
+        mock_client.return_value.get_symbol_info.return_value = {
+            'filters': [
+                {'filterType': 'LOT_SIZE', 'stepSize': '0.001', 'minQty': '0.001'}
+            ]
+        }
+        
+        # Test position sizing
+        quantity = bot.calculate_position_size('BTCUSDT', 50000.0)
+        
+        # With 1% risk on 10000 balance = 100 USD
+        # 100 / 50000 = 0.002 BTC
+        self.assertIsNotNone(quantity)
+        self.assertGreater(quantity, 0)
 
 
 if __name__ == '__main__':

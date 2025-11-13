@@ -6,10 +6,12 @@ Unit tests for the Advanced Binance Scalping Bot
 import unittest
 import json
 import os
+import time
 import tempfile
 from unittest.mock import Mock, patch, MagicMock
 import numpy as np
 from scalable_scalping_bot import BollingerBands, RSI, ScalpingBot, BacktestSimulator
+from binance.exceptions import BinanceAPIException
 
 
 class TestBollingerBands(unittest.TestCase):
@@ -446,6 +448,299 @@ class TestEnhancedFeatures(unittest.TestCase):
         # 100 / 50000 = 0.002 BTC
         self.assertIsNotNone(quantity)
         self.assertGreater(quantity, 0)
+
+
+class TestPlaceOCOOrder(unittest.TestCase):
+    """Test cases for the modified place_oco_order function"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.config_data = {
+            "api_key": "test_key",
+            "api_secret": "test_secret",
+            "testnet": True,
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1m",
+            "bollinger_bands": {
+                "period": 20,
+                "std_dev": 2
+            },
+            "trade_params": {
+                "quantity_percentage": 0.1,
+                "take_profit_percentage": 0.5,
+                "stop_loss_percentage": 0.3,
+                "max_open_positions": 3
+            },
+            "risk_management": {
+                "max_position_size_usd": 100,
+                "min_spread_percentage": 0.05
+            },
+            "execution": {
+                "websocket_enabled": False,
+                "order_retry_attempts": 3,
+                "latency_optimization": True
+            }
+        }
+        
+        self.temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(self.config_data, self.temp_file)
+        self.temp_file.close()
+    
+    def tearDown(self):
+        """Clean up"""
+        if os.path.exists(self.temp_file.name):
+            os.unlink(self.temp_file.name)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_place_separate_orders_buy(self, mock_client):
+        """Test placing separate TP and SL orders for a BUY position"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock symbol info
+        mock_client.return_value.get_symbol_info.return_value = {
+            'filters': [
+                {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'}
+            ]
+        }
+        
+        # Mock order creation responses
+        tp_order_response = {'orderId': 12345, 'status': 'NEW'}
+        sl_order_response = {'orderId': 12346, 'status': 'NEW'}
+        
+        mock_client.return_value.create_order.side_effect = [tp_order_response, sl_order_response]
+        
+        # Place orders
+        result = bot.place_oco_order('BTCUSDT', 'BUY', 0.001, 50000.0)
+        
+        # Verify result
+        self.assertIsNotNone(result)
+        self.assertIn('take_profit_order_id', result)
+        self.assertIn('stop_loss_order_id', result)
+        self.assertEqual(result['take_profit_order_id'], 12345)
+        self.assertEqual(result['stop_loss_order_id'], 12346)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_place_separate_orders_sell(self, mock_client):
+        """Test placing separate TP and SL orders for a SELL position"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock symbol info
+        mock_client.return_value.get_symbol_info.return_value = {
+            'filters': [
+                {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'}
+            ]
+        }
+        
+        # Mock order creation responses
+        tp_order_response = {'orderId': 22345, 'status': 'NEW'}
+        sl_order_response = {'orderId': 22346, 'status': 'NEW'}
+        
+        mock_client.return_value.create_order.side_effect = [tp_order_response, sl_order_response]
+        
+        # Place orders
+        result = bot.place_oco_order('BTCUSDT', 'SELL', 0.001, 50000.0)
+        
+        # Verify result
+        self.assertIsNotNone(result)
+        self.assertIn('take_profit_order_id', result)
+        self.assertIn('stop_loss_order_id', result)
+        self.assertEqual(result['take_profit_order_id'], 22345)
+        self.assertEqual(result['stop_loss_order_id'], 22346)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_place_orders_with_tp_failure(self, mock_client):
+        """Test that when TP placement fails, no orders are placed"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock symbol info
+        mock_client.return_value.get_symbol_info.return_value = {
+            'filters': [
+                {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'}
+            ]
+        }
+        
+        # Create a mock response object
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = '{"code":-1013,"msg":"Test error"}'
+        
+        # Mock order creation to fail
+        mock_client.return_value.create_order.side_effect = BinanceAPIException(mock_response, 400, '{"code":-1013,"msg":"Test error"}')
+        
+        # Place orders
+        result = bot.place_oco_order('BTCUSDT', 'BUY', 0.001, 50000.0)
+        
+        # Verify result is None on failure
+        self.assertIsNone(result)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_place_orders_with_sl_failure_cancels_tp(self, mock_client):
+        """Test that when SL placement fails, TP order is cancelled"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Mock symbol info
+        mock_client.return_value.get_symbol_info.return_value = {
+            'filters': [
+                {'filterType': 'PRICE_FILTER', 'tickSize': '0.01'}
+            ]
+        }
+        
+        # Create a mock response object
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.text = '{"code":-1013,"msg":"Test error"}'
+        
+        # Mock order creation: TP succeeds, SL fails
+        tp_order_response = {'orderId': 32345, 'status': 'NEW'}
+        mock_client.return_value.create_order.side_effect = [
+            tp_order_response,  # First call succeeds (TP)
+            BinanceAPIException(mock_response, 400, '{"code":-1013,"msg":"Test error"}'),  # Second call fails (SL)
+            tp_order_response,  # Retry: First call succeeds (TP)
+            BinanceAPIException(mock_response, 400, '{"code":-1013,"msg":"Test error"}'),  # Retry: Second call fails (SL)
+            tp_order_response,  # Retry: First call succeeds (TP)
+            BinanceAPIException(mock_response, 400, '{"code":-1013,"msg":"Test error"}')  # Retry: Second call fails (SL)
+        ]
+        
+        # Place orders
+        result = bot.place_oco_order('BTCUSDT', 'BUY', 0.001, 50000.0)
+        
+        # Verify result is None after all retries fail
+        self.assertIsNone(result)
+        
+        # Verify cancel_order was called for each TP order
+        self.assertEqual(mock_client.return_value.cancel_order.call_count, 3)
+
+
+class TestCheckOCOStatus(unittest.TestCase):
+    """Test cases for the modified check_oco_status function"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.config_data = {
+            "api_key": "test_key",
+            "api_secret": "test_secret",
+            "testnet": True,
+            "symbols": ["BTCUSDT"],
+            "timeframe": "1m",
+            "bollinger_bands": {
+                "period": 20,
+                "std_dev": 2
+            },
+            "trade_params": {
+                "quantity_percentage": 0.1,
+                "take_profit_percentage": 0.5,
+                "stop_loss_percentage": 0.3,
+                "max_open_positions": 3
+            },
+            "risk_management": {
+                "max_position_size_usd": 100,
+                "min_spread_percentage": 0.05
+            },
+            "execution": {
+                "websocket_enabled": False,
+                "order_retry_attempts": 3,
+                "latency_optimization": True
+            }
+        }
+        
+        self.temp_file = tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False)
+        json.dump(self.config_data, self.temp_file)
+        self.temp_file.close()
+    
+    def tearDown(self):
+        """Clean up"""
+        if os.path.exists(self.temp_file.name):
+            os.unlink(self.temp_file.name)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_check_status_tp_filled(self, mock_client):
+        """Test that when TP is filled, SL is cancelled"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Add a mock position
+        bot.current_positions['BTCUSDT'] = {
+            'entry_price': 50000.0,
+            'quantity': 0.001,
+            'side': 'BUY',
+            'entry_time': time.time(),
+            'take_profit_order_id': 12345,
+            'stop_loss_order_id': 12346
+        }
+        
+        # Mock get_order responses
+        mock_client.return_value.get_order.side_effect = [
+            {'status': 'FILLED', 'orderId': 12345},  # TP order filled
+            {'status': 'NEW', 'orderId': 12346}  # SL order still open
+        ]
+        
+        # Check status
+        bot.check_oco_status('BTCUSDT')
+        
+        # Verify SL was cancelled
+        mock_client.return_value.cancel_order.assert_called_once_with(symbol='BTCUSDT', orderId=12346)
+        
+        # Verify position was removed
+        self.assertNotIn('BTCUSDT', bot.current_positions)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_check_status_sl_filled(self, mock_client):
+        """Test that when SL is filled, TP is cancelled"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Add a mock position
+        bot.current_positions['BTCUSDT'] = {
+            'entry_price': 50000.0,
+            'quantity': 0.001,
+            'side': 'BUY',
+            'entry_time': time.time(),
+            'take_profit_order_id': 12345,
+            'stop_loss_order_id': 12346
+        }
+        
+        # Mock get_order responses
+        mock_client.return_value.get_order.side_effect = [
+            {'status': 'NEW', 'orderId': 12345},  # TP order still open
+            {'status': 'FILLED', 'orderId': 12346}  # SL order filled
+        ]
+        
+        # Check status
+        bot.check_oco_status('BTCUSDT')
+        
+        # Verify TP was cancelled
+        mock_client.return_value.cancel_order.assert_called_once_with(symbol='BTCUSDT', orderId=12345)
+        
+        # Verify position was removed
+        self.assertNotIn('BTCUSDT', bot.current_positions)
+    
+    @patch('scalable_scalping_bot.Client')
+    def test_check_status_both_open(self, mock_client):
+        """Test that when both orders are open, position remains"""
+        bot = ScalpingBot(self.temp_file.name)
+        
+        # Add a mock position
+        bot.current_positions['BTCUSDT'] = {
+            'entry_price': 50000.0,
+            'quantity': 0.001,
+            'side': 'BUY',
+            'entry_time': time.time(),
+            'take_profit_order_id': 12345,
+            'stop_loss_order_id': 12346
+        }
+        
+        # Mock get_order responses
+        mock_client.return_value.get_order.side_effect = [
+            {'status': 'NEW', 'orderId': 12345},  # TP order still open
+            {'status': 'NEW', 'orderId': 12346}  # SL order still open
+        ]
+        
+        # Check status
+        bot.check_oco_status('BTCUSDT')
+        
+        # Verify no orders were cancelled
+        mock_client.return_value.cancel_order.assert_not_called()
+        
+        # Verify position still exists
+        self.assertIn('BTCUSDT', bot.current_positions)
 
 
 if __name__ == '__main__':

@@ -437,7 +437,11 @@ class ScalpingBot:
     def place_oco_order(self, symbol: str, side: str, quantity: float, 
                         price: float) -> Optional[dict]:
         """
-        Place OCO (One-Cancels-the-Other) order for stop-loss and take-profit
+        Place separate limit (take-profit) and stop-loss orders
+        
+        This replaces the OCO order functionality with two separate orders:
+        1. A limit order for take-profit
+        2. A stop-loss limit order for stop-loss
         
         Args:
             symbol: Trading pair
@@ -446,18 +450,18 @@ class ScalpingBot:
             price: Current market price
         
         Returns:
-            Order response or None if failed
+            Dict with both order responses or None if failed
         """
         trade_params = self.config['trade_params']
         
         if side == 'BUY':
             # For a BUY, we need to SELL to close (take profit above, stop loss below)
-            oco_side = SIDE_SELL
+            exit_side = SIDE_SELL
             stop_price = price * (1 - trade_params['stop_loss_percentage'] / 100)
             take_profit_price = price * (1 + trade_params['take_profit_percentage'] / 100)
         else:
             # For a SELL, we need to BUY to close (take profit below, stop loss above)
-            oco_side = SIDE_BUY
+            exit_side = SIDE_BUY
             stop_price = price * (1 + trade_params['stop_loss_percentage'] / 100)
             take_profit_price = price * (1 - trade_params['take_profit_percentage'] / 100)
         
@@ -474,33 +478,67 @@ class ScalpingBot:
                 precision = len(str(tick_size).rstrip('0').split('.')[-1])
                 stop_price = round(stop_price, precision)
                 take_profit_price = round(take_profit_price, precision)
-                stop_limit_price = round(stop_price * 0.995, precision)  # Slightly below stop
+                stop_limit_price = round(stop_price * 0.995, precision) if side == 'BUY' else round(stop_price * 1.005, precision)
         except Exception as e:
             logger.error(f"Error getting price precision for {symbol}: {e}")
             return None
         
-        # Place OCO order with retry logic
+        # Place separate orders with retry logic
+        take_profit_order = None
+        stop_loss_order = None
+        
         for attempt in range(self.order_retry_attempts):
             try:
-                logger.info(f"Placing OCO order for {symbol}: TP={take_profit_price:.8f}, SL={stop_price:.8f}")
+                logger.info(f"Placing separate TP and SL orders for {symbol}: TP={take_profit_price:.8f}, SL={stop_price:.8f}")
                 
-                order = self.client.create_oco_order(
+                # Place take-profit limit order
+                take_profit_order = self.client.create_order(
                     symbol=symbol,
-                    side=oco_side,
+                    side=exit_side,
+                    type=ORDER_TYPE_LIMIT,
                     quantity=quantity,
                     price=take_profit_price,
-                    stopPrice=stop_price,
-                    stopLimitPrice=stop_limit_price,
-                    stopLimitTimeInForce=TIME_IN_FORCE_GTC
+                    timeInForce=TIME_IN_FORCE_GTC
                 )
                 
-                logger.info(f"OCO order placed successfully for {symbol}")
-                return order
+                logger.info(f"Take-profit order placed for {symbol}: ID={take_profit_order['orderId']}")
+                
+                # Place stop-loss limit order
+                stop_loss_order = self.client.create_order(
+                    symbol=symbol,
+                    side=exit_side,
+                    type=ORDER_TYPE_STOP_LOSS_LIMIT,
+                    quantity=quantity,
+                    price=stop_limit_price,
+                    stopPrice=stop_price,
+                    timeInForce=TIME_IN_FORCE_GTC
+                )
+                
+                logger.info(f"Stop-loss order placed for {symbol}: ID={stop_loss_order['orderId']}")
+                
+                # Return both orders in a compatible format
+                return {
+                    'take_profit_order': take_profit_order,
+                    'stop_loss_order': stop_loss_order,
+                    'take_profit_order_id': take_profit_order['orderId'],
+                    'stop_loss_order_id': stop_loss_order['orderId']
+                }
                 
             except BinanceAPIException as e:
-                logger.error(f"Attempt {attempt + 1}/{self.order_retry_attempts} - Error placing OCO order for {symbol}: {e}")
+                logger.error(f"Attempt {attempt + 1}/{self.order_retry_attempts} - Error placing orders for {symbol}: {e}")
+                
+                # If take-profit order was placed but stop-loss failed, cancel take-profit
+                if take_profit_order and not stop_loss_order:
+                    try:
+                        self.client.cancel_order(symbol=symbol, orderId=take_profit_order['orderId'])
+                        logger.info(f"Cancelled take-profit order {take_profit_order['orderId']} after stop-loss placement failed")
+                    except Exception as cancel_error:
+                        logger.error(f"Error cancelling take-profit order: {cancel_error}")
+                
                 if attempt < self.order_retry_attempts - 1:
                     time.sleep(0.1)  # Brief delay before retry
+                    take_profit_order = None
+                    stop_loss_order = None
                 else:
                     return None
         
@@ -559,10 +597,10 @@ class ScalpingBot:
             # Get actual fill price
             fill_price = float(market_order['fills'][0]['price']) if market_order.get('fills') else current_price
             
-            # Place OCO order for exit
-            oco_order = self.place_oco_order(symbol, signal, quantity, fill_price)
+            # Place separate TP and SL orders for exit
+            exit_orders = self.place_oco_order(symbol, signal, quantity, fill_price)
             
-            if oco_order:
+            if exit_orders:
                 # Track position
                 with self.lock:
                     self.current_positions[symbol] = {
@@ -570,32 +608,68 @@ class ScalpingBot:
                         'quantity': quantity,
                         'side': signal,
                         'entry_time': time.time(),
-                        'oco_order_id': oco_order['orderListId']
+                        'take_profit_order_id': exit_orders['take_profit_order_id'],
+                        'stop_loss_order_id': exit_orders['stop_loss_order_id']
                     }
                 logger.info(f"Position opened for {symbol}: {signal} {quantity} @ {fill_price:.8f}")
             else:
-                logger.error(f"Failed to place OCO order for {symbol}. Position may be at risk.")
+                logger.error(f"Failed to place exit orders for {symbol}. Position may be at risk.")
                 
         except BinanceAPIException as e:
             logger.error(f"Error executing trade for {symbol}: {e}")
     
     def check_oco_status(self, symbol: str):
-        """Check and update OCO order status"""
+        """Check and update order status for take-profit and stop-loss orders"""
         position = self.current_positions.get(symbol)
         if not position:
             return
         
         try:
-            order_list = self.client.get_order_list(orderListId=position['oco_order_id'])
+            # Check take-profit order status
+            tp_order = self.client.get_order(
+                symbol=symbol,
+                orderId=position['take_profit_order_id']
+            )
             
-            if order_list['listOrderStatus'] == 'ALL_DONE':
+            # Check stop-loss order status
+            sl_order = self.client.get_order(
+                symbol=symbol,
+                orderId=position['stop_loss_order_id']
+            )
+            
+            # Check if either order is filled
+            tp_filled = tp_order['status'] == 'FILLED'
+            sl_filled = sl_order['status'] == 'FILLED'
+            
+            if tp_filled or sl_filled:
+                # One order executed, cancel the other
+                if tp_filled:
+                    logger.info(f"Take-profit order filled for {symbol}")
+                    # Cancel stop-loss order
+                    try:
+                        self.client.cancel_order(symbol=symbol, orderId=position['stop_loss_order_id'])
+                        logger.info(f"Cancelled stop-loss order for {symbol}")
+                    except BinanceAPIException as e:
+                        # Order might already be cancelled or filled
+                        logger.warning(f"Could not cancel stop-loss order for {symbol}: {e}")
+                
+                elif sl_filled:
+                    logger.info(f"Stop-loss order filled for {symbol}")
+                    # Cancel take-profit order
+                    try:
+                        self.client.cancel_order(symbol=symbol, orderId=position['take_profit_order_id'])
+                        logger.info(f"Cancelled take-profit order for {symbol}")
+                    except BinanceAPIException as e:
+                        # Order might already be cancelled or filled
+                        logger.warning(f"Could not cancel take-profit order for {symbol}: {e}")
+                
                 # Position closed
                 logger.info(f"Position closed for {symbol}")
                 with self.lock:
                     del self.current_positions[symbol]
                     
         except BinanceAPIException as e:
-            logger.error(f"Error checking OCO status for {symbol}: {e}")
+            logger.error(f"Error checking order status for {symbol}: {e}")
     
     def process_kline(self, symbol: str, kline: dict):
         """Process kline data for a symbol"""
